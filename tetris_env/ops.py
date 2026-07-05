@@ -5,8 +5,8 @@ import torch
 from . import _C  # noqa: F401
 
 
-def start(envs: int, envs_per_thread: int = 1) -> None:
-    torch.ops.TetrisEnvBranchless.start(envs, envs_per_thread)
+def start(envs: int, envs_per_thread: int = 1, drop_speed: int = 1) -> None:
+    torch.ops.TetrisEnvBranchless.start(envs, envs_per_thread, drop_speed)
 
 
 def step(

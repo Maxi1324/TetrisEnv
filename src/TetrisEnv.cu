@@ -21,11 +21,13 @@ __constant__ uint64_t BLOCKTYPES[7];
 static uint32_t* gamefield = nullptr;
 static uint64_t* blockProjection = nullptr;
 static uint64_t* rngState = nullptr;
+static uint32_t* frameCounter = nullptr;
 static uint32_t* episodeLength = nullptr;
 static uint32_t* episodeRows = nullptr;
 static unsigned long long* statsCounters = nullptr;
 static uint64_t envsCount = 0;
 static int runtimeEnvsPerThread = 1;
+static int runtimeDropSpeed = 1;
 
 __device__ __forceinline__ uint32_t getCell(const uint32_t* field, int x, int y)
 {
@@ -53,7 +55,7 @@ __device__ __forceinline__ int randomTileType(int env, uint64_t* rng)
 __device__ __forceinline__ uint64_t generateNewTile(int env, uint64_t* rng)
 {
     uint64_t rawProjection = BLOCKTYPES[randomTileType(env, rng)];
-    uint64_t offset = 3ull | (4ull << COORD_BITS);
+    uint64_t offset = 4ull;
     uint64_t parallelOffset = offset | (offset << 10) | (offset << 20) | (offset << 30);
     return rawProjection + parallelOffset;
 }
@@ -66,12 +68,13 @@ __global__ void setupKernel(uint64_t* __restrict__ projection, uint64_t* __restr
     }
 }
 
-void start(int64_t envs, int64_t envsPerThread)
+void start(int64_t envs, int64_t envsPerThread, int64_t dropSpeed)
 {
     if (gamefield != nullptr) {
         cudaFree(gamefield);
         cudaFree(blockProjection);
         cudaFree(rngState);
+        cudaFree(frameCounter);
         cudaFree(episodeLength);
         cudaFree(episodeRows);
         cudaFree(statsCounters);
@@ -79,9 +82,11 @@ void start(int64_t envs, int64_t envsPerThread)
 
     envsCount = (uint64_t)envs;
     runtimeEnvsPerThread = (int)envsPerThread;
+    runtimeDropSpeed = dropSpeed > 1 ? (int)dropSpeed : 1;
     cudaMalloc(&gamefield, sizeof(uint32_t) * 8 * envsCount);
     cudaMalloc(&blockProjection, sizeof(uint64_t) * envsCount);
     cudaMalloc(&rngState, sizeof(uint64_t) * envsCount);
+    cudaMalloc(&frameCounter, sizeof(uint32_t) * envsCount);
     cudaMalloc(&episodeLength, sizeof(uint32_t) * envsCount);
     cudaMalloc(&episodeRows, sizeof(uint32_t) * envsCount);
     cudaMalloc(&statsCounters, sizeof(unsigned long long) * 3);
@@ -109,6 +114,7 @@ void start(int64_t envs, int64_t envsPerThread)
     free(rngCpu);
     cudaMemset(gamefield, 0, sizeof(uint32_t) * 8 * envsCount);
     cudaMemset(blockProjection, 0, sizeof(uint64_t) * envsCount);
+    cudaMemset(frameCounter, 0, sizeof(uint32_t) * envsCount);
     cudaMemset(episodeLength, 0, sizeof(uint32_t) * envsCount);
     cudaMemset(episodeRows, 0, sizeof(uint32_t) * envsCount);
     cudaMemset(statsCounters, 0, sizeof(unsigned long long) * 3);
@@ -282,14 +288,28 @@ __device__ __forceinline__ void clearGameField(uint32_t* field)
     }
 }
 
-__device__ __forceinline__ void imageObservation(const uint32_t* field, float* observation)
+__device__ __forceinline__ bool projectionHasCell(uint64_t proj, int cell)
+{
+    bool hit = false;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int shift = i * BLOCK_BITS;
+        int x = (proj >> shift) & COORD_MASK;
+        int y = (proj >> (shift + COORD_BITS)) & COORD_MASK;
+        hit |= (y * 10 + x) == cell;
+    }
+    return hit;
+}
+
+__device__ __forceinline__ void imageObservation(const uint32_t* field, uint64_t proj, float* observation)
 {
     for (int i = 0; i < 200; i++) {
-        observation[i] = (float)((field[i >> 5] >> (i & 31)) & 1u);
+        uint32_t boardCell = (field[i >> 5] >> (i & 31)) & 1u;
+        observation[i] = (float)(boardCell | (uint32_t)projectionHasCell(proj, i));
     }
 }
 
-__device__ __forceinline__ void topProjectionObservation(const uint32_t* field, float* observation)
+__device__ __forceinline__ void topProjectionObservation(const uint32_t* field, uint64_t proj, float* observation)
 {
     #pragma unroll
     for (int x = 0; x < 10; x++) {
@@ -302,6 +322,13 @@ __device__ __forceinline__ void topProjectionObservation(const uint32_t* field, 
         }
         observation[x] = firstHit;
     }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int shift = i * BLOCK_BITS;
+        observation[10 + i * 2] = (float)((proj >> shift) & COORD_MASK);
+        observation[11 + i * 2] = (float)((proj >> (shift + COORD_BITS)) & COORD_MASK);
+    }
 }
 
 __global__ void stepKernel(const uint32_t* __restrict__ actions,
@@ -311,6 +338,8 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
                            uint64_t* __restrict__ rng,
                            bool imageObs,
                            int envsPerThread,
+                           int dropSpeed,
+                           uint32_t* __restrict__ frames,
                            uint32_t* __restrict__ episodeLengths,
                            uint32_t* __restrict__ episodeRowCounts,
                            unsigned long long* __restrict__ counters,
@@ -342,10 +371,12 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     bool isDone = false;
     uint32_t currentEpisodeLength = episodeLengths[env] + 1u;
     uint32_t currentEpisodeRows = episodeRowCounts[env];
+    uint32_t frame = frames[env];
+    bool shouldDrop = (dropSpeed <= 1) || ((frame % (uint32_t)dropSpeed) == 0u);
     unsigned int collision = 0;
-    uint64_t movedDown = moveDown(proj, field, &collision);
+    uint64_t movedDown = shouldDrop ? moveDown(proj, field, &collision) : proj;
 
-    if (collision) {
+    if (shouldDrop && collision) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             int shift = i * BLOCK_BITS;
@@ -372,6 +403,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
         proj = newProjection;
     } else {
         proj = movedDown;
+        frames[env] = frame + 1u;
     }
 
     projections[env] = proj;
@@ -381,9 +413,9 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     done[env] = isDone;
 
     if (imageObs) {
-        imageObservation(field, observations + env * 200);
+        imageObservation(field, proj, observations + env * 200);
     } else {
-        topProjectionObservation(field, observations + env * 10);
+        topProjectionObservation(field, proj, observations + env * 18);
     }
     }
 }
@@ -418,6 +450,8 @@ torch::Tensor step(torch::Tensor actions, torch::Tensor observations, torch::Ten
                                         rngState,
                                         imageObservation,
                                         runtimeEnvsPerThread,
+                                        runtimeDropSpeed,
+                                        frameCounter,
                                         episodeLength,
                                         episodeRows,
                                         statsCounters,
@@ -432,7 +466,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 
 TORCH_LIBRARY(TetrisEnvBranchless, m) {
-    m.def("start(int envs, int envs_per_thread) -> ()");
+    m.def("start(int envs, int envs_per_thread, int drop_speed) -> ()");
     m.def("step(Tensor actions, Tensor(a!) observations, Tensor(b!) rewards, Tensor(c!) done, bool image_observation) -> Tensor");
 }
 
