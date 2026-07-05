@@ -21,6 +21,9 @@ __constant__ uint64_t BLOCKTYPES[7];
 static uint32_t* gamefield = nullptr;
 static uint64_t* blockProjection = nullptr;
 static uint64_t* rngState = nullptr;
+static uint32_t* episodeLength = nullptr;
+static uint32_t* episodeRows = nullptr;
+static unsigned long long* statsCounters = nullptr;
 static uint64_t envsCount = 0;
 static int runtimeEnvsPerThread = 1;
 
@@ -69,6 +72,9 @@ void start(int64_t envs, int64_t envsPerThread)
         cudaFree(gamefield);
         cudaFree(blockProjection);
         cudaFree(rngState);
+        cudaFree(episodeLength);
+        cudaFree(episodeRows);
+        cudaFree(statsCounters);
     }
 
     envsCount = (uint64_t)envs;
@@ -76,6 +82,9 @@ void start(int64_t envs, int64_t envsPerThread)
     cudaMalloc(&gamefield, sizeof(uint32_t) * 8 * envsCount);
     cudaMalloc(&blockProjection, sizeof(uint64_t) * envsCount);
     cudaMalloc(&rngState, sizeof(uint64_t) * envsCount);
+    cudaMalloc(&episodeLength, sizeof(uint32_t) * envsCount);
+    cudaMalloc(&episodeRows, sizeof(uint32_t) * envsCount);
+    cudaMalloc(&statsCounters, sizeof(unsigned long long) * 3);
 
     uint64_t blockTypeData[7] = {
         SHAPE(1, 0, 1, 1, 1, 2, 1, 3),
@@ -100,6 +109,9 @@ void start(int64_t envs, int64_t envsPerThread)
     free(rngCpu);
     cudaMemset(gamefield, 0, sizeof(uint32_t) * 8 * envsCount);
     cudaMemset(blockProjection, 0, sizeof(uint64_t) * envsCount);
+    cudaMemset(episodeLength, 0, sizeof(uint32_t) * envsCount);
+    cudaMemset(episodeRows, 0, sizeof(uint32_t) * envsCount);
+    cudaMemset(statsCounters, 0, sizeof(unsigned long long) * 3);
 
     const int blockSize = 256;
     int gridSize = (int)((envsCount + blockSize - 1) / blockSize);
@@ -299,6 +311,9 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
                            uint64_t* __restrict__ rng,
                            bool imageObs,
                            int envsPerThread,
+                           uint32_t* __restrict__ episodeLengths,
+                           uint32_t* __restrict__ episodeRowCounts,
+                           unsigned long long* __restrict__ counters,
                            float* __restrict__ observations,
                            float* __restrict__ rewards,
                            bool* __restrict__ done)
@@ -325,6 +340,8 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
 
     float reward = 0.0f;
     bool isDone = false;
+    uint32_t currentEpisodeLength = episodeLengths[env] + 1u;
+    uint32_t currentEpisodeRows = episodeRowCounts[env];
     unsigned int collision = 0;
     uint64_t movedDown = moveDown(proj, field, &collision);
 
@@ -342,8 +359,15 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
             clearGameField(field);
             reward = -1.0f;
             isDone = true;
+            atomicAdd(counters + 0, 1ull);
+            atomicAdd(counters + 1, (unsigned long long)currentEpisodeLength);
+            atomicAdd(counters + 2, (unsigned long long)currentEpisodeRows);
+            currentEpisodeLength = 0u;
+            currentEpisodeRows = 0u;
         } else {
-            reward = (float)clearLines(field);
+            int cleared = clearLines(field);
+            reward = (float)cleared;
+            currentEpisodeRows += (uint32_t)cleared;
         }
         proj = newProjection;
     } else {
@@ -351,6 +375,8 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     }
 
     projections[env] = proj;
+    episodeLengths[env] = currentEpisodeLength;
+    episodeRowCounts[env] = currentEpisodeRows;
     rewards[env] = reward;
     done[env] = isDone;
 
@@ -362,12 +388,26 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     }
 }
 
-void step(torch::Tensor actions, torch::Tensor observations, torch::Tensor rewards, torch::Tensor done, bool imageObservation)
+__global__ void statsKernel(const unsigned long long* __restrict__ counters, float* __restrict__ out)
+{
+    unsigned long long episodes = counters[0];
+    if (episodes == 0ull) {
+        out[0] = 0.0f;
+        out[1] = 0.0f;
+        return;
+    }
+    out[0] = (float)((double)counters[1] / (double)episodes);
+    out[1] = (float)((double)counters[2] / (double)episodes);
+}
+
+torch::Tensor step(torch::Tensor actions, torch::Tensor observations, torch::Tensor rewards, torch::Tensor done, bool imageObservation)
 {
     const uint32_t* actionData = actions.const_data_ptr<uint32_t>();
     float* observationData = observations.mutable_data_ptr<float>();
     float* rewardData = rewards.mutable_data_ptr<float>();
     bool* doneData = done.mutable_data_ptr<bool>();
+    torch::Tensor stats = torch::empty({2}, actions.options().dtype(at::kFloat));
+    float* statsData = stats.mutable_data_ptr<float>();
 
     const int blockSize = 256;
     int gridSize = (int)((envsCount + blockSize * runtimeEnvsPerThread - 1) / (blockSize * runtimeEnvsPerThread));
@@ -378,9 +418,14 @@ void step(torch::Tensor actions, torch::Tensor observations, torch::Tensor rewar
                                         rngState,
                                         imageObservation,
                                         runtimeEnvsPerThread,
+                                        episodeLength,
+                                        episodeRows,
+                                        statsCounters,
                                         observationData,
                                         rewardData,
                                         doneData);
+    statsKernel<<<1, 1>>>(statsCounters, statsData);
+    return stats;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -388,7 +433,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 TORCH_LIBRARY(TetrisEnvBranchless, m) {
     m.def("start(int envs, int envs_per_thread) -> ()");
-    m.def("step(Tensor actions, Tensor(a!) observations, Tensor(b!) rewards, Tensor(c!) done, bool image_observation) -> ()");
+    m.def("step(Tensor actions, Tensor(a!) observations, Tensor(b!) rewards, Tensor(c!) done, bool image_observation) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(TetrisEnvBranchless, CatchAll, m) {

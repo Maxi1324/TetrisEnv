@@ -18,5 +18,4 @@ def step(
 ) -> torch.Tensor:
     if done is None:
         done = torch.empty_like(rewards, dtype=torch.bool)
-    torch.ops.TetrisEnvBranchless.step(actions, observations, rewards, done, image_observation)
-    return done
+    return torch.ops.TetrisEnvBranchless.step(actions, observations, rewards, done, image_observation)

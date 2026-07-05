@@ -30,6 +30,9 @@ observations = torch.empty((envs, 10), device="cuda", dtype=torch.float32)
 rewards = torch.empty(envs, device="cuda", dtype=torch.float32)
 done = torch.empty(envs, device="cuda", dtype=torch.bool)
 
-tetris_env.step(actions, observations, rewards, done, image_observation=False)
+stats = tetris_env.step(actions, observations, rewards, done, image_observation=False)
 torch.cuda.synchronize()
+
+avg_episode_length = stats[0]
+avg_rows_cleared = stats[1]
 ```
