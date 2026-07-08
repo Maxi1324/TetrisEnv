@@ -12,6 +12,8 @@
 #define BLOCK_BITS 10
 #define COORD_MASK 31
 #define ROW_MASK 1023u
+#define SURVIVAL_REWARD 0.01f
+#define PLACED_BLOCK_REWARD 0.1f
 #define PACK(x, y) ((uint64_t)(x) | ((uint64_t)(y) << COORD_BITS))
 #define SHAPE(x0, y0, x1, y1, x2, y2, x3, y3) \
     (PACK(x0, y0) | (PACK(x1, y1) << 10) | (PACK(x2, y2) << 20) | (PACK(x3, y3) << 30))
@@ -367,7 +369,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     uint64_t keepMask = ~(leftMask | rotateMask | rightMask);
     proj = (leftMoved & leftMask) | (rotated & rotateMask) | (rightMoved & rightMask) | (proj & keepMask);
 
-    float reward = 0.0f;
+    float reward = SURVIVAL_REWARD;
     bool isDone = false;
     uint32_t currentEpisodeLength = episodeLengths[env] + 1u;
     uint32_t currentEpisodeRows = episodeRowCounts[env];
@@ -397,7 +399,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
             currentEpisodeRows = 0u;
         } else {
             int cleared = clearLines(field);
-            reward = (float)cleared;
+            reward += PLACED_BLOCK_REWARD + (float)cleared;
             currentEpisodeRows += (uint32_t)cleared;
         }
         proj = newProjection;
