@@ -12,13 +12,12 @@
 #define BLOCK_BITS 10
 #define COORD_MASK 31
 #define ROW_MASK 1023u
-#define SURVIVAL_REWARD 0.01f
-#define PLACED_BLOCK_REWARD 0.1f
 #define PACK(x, y) ((uint64_t)(x) | ((uint64_t)(y) << COORD_BITS))
 #define SHAPE(x0, y0, x1, y1, x2, y2, x3, y3) \
     (PACK(x0, y0) | (PACK(x1, y1) << 10) | (PACK(x2, y2) << 20) | (PACK(x3, y3) << 30))
 
 __constant__ uint64_t BLOCKTYPES[7];
+__constant__ float REWARD_MULTIPLIERS[4];
 
 static uint32_t* gamefield = nullptr;
 static uint64_t* blockProjection = nullptr;
@@ -70,7 +69,13 @@ __global__ void setupKernel(uint64_t* __restrict__ projection, uint64_t* __restr
     }
 }
 
-void start(int64_t envs, int64_t envsPerThread, int64_t dropSpeed)
+void start(int64_t envs,
+           int64_t envsPerThread,
+           int64_t dropSpeed,
+           double survivalReward,
+           double placedBlockReward,
+           double lineClearReward,
+           double gameOverReward)
 {
     if (gamefield != nullptr) {
         cudaFree(gamefield);
@@ -103,6 +108,13 @@ void start(int64_t envs, int64_t envsPerThread, int64_t dropSpeed)
         SHAPE(1, 1, 2, 1, 1, 2, 1, 3),
     };
     cudaMemcpyToSymbol(BLOCKTYPES, blockTypeData, sizeof(blockTypeData));
+    float rewardMultiplierData[4] = {
+        (float)survivalReward,
+        (float)placedBlockReward,
+        (float)lineClearReward,
+        (float)gameOverReward,
+    };
+    cudaMemcpyToSymbol(REWARD_MULTIPLIERS, rewardMultiplierData, sizeof(rewardMultiplierData));
 
     auto* rngCpu = (uint64_t*)malloc(sizeof(uint64_t) * envsCount);
     std::random_device rd;
@@ -369,7 +381,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     uint64_t keepMask = ~(leftMask | rotateMask | rightMask);
     proj = (leftMoved & leftMask) | (rotated & rotateMask) | (rightMoved & rightMask) | (proj & keepMask);
 
-    float reward = SURVIVAL_REWARD;
+    float reward = REWARD_MULTIPLIERS[0];
     bool isDone = false;
     uint32_t currentEpisodeLength = episodeLengths[env] + 1u;
     uint32_t currentEpisodeRows = episodeRowCounts[env];
@@ -390,7 +402,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
         uint64_t newProjection = generateNewTile(env, rng);
         if (isGameOver(newProjection, field)) {
             clearGameField(field);
-            reward = -1.0f;
+            reward = REWARD_MULTIPLIERS[3];
             isDone = true;
             atomicAdd(counters + 0, 1ull);
             atomicAdd(counters + 1, (unsigned long long)currentEpisodeLength);
@@ -399,7 +411,7 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
             currentEpisodeRows = 0u;
         } else {
             int cleared = clearLines(field);
-            reward += PLACED_BLOCK_REWARD + (float)cleared;
+            reward += REWARD_MULTIPLIERS[1] + REWARD_MULTIPLIERS[2] * (float)cleared;
             currentEpisodeRows += (uint32_t)cleared;
         }
         proj = newProjection;
@@ -468,7 +480,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 
 TORCH_LIBRARY(TetrisEnvBranchless, m) {
-    m.def("start(int envs, int envs_per_thread, int drop_speed) -> ()");
+    m.def("start(int envs, int envs_per_thread, int drop_speed, float survival_reward, float placed_block_reward, float line_clear_reward, float game_over_reward) -> ()");
     m.def("step(Tensor actions, Tensor(a!) observations, Tensor(b!) rewards, Tensor(c!) done, bool image_observation) -> Tensor");
 }
 
