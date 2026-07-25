@@ -7,8 +7,10 @@ CUDA vectorized Tetris environment exposed as PyTorch custom operators.
 From GitHub:
 
 ```powershell
-pip install git+https://github.com/Maxi1324/TetrisEnv.git
+uv pip install git+https://github.com/Maxi1324/TetrisEnv.git --no-build-isolation
 ```
+
+Install PyTorch with the matching CUDA wheel before installing this package.
 
 Run from the repository root:
 

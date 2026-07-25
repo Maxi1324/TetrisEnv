@@ -12,6 +12,7 @@
 #define BLOCK_BITS 10
 #define COORD_MASK 31
 #define ROW_MASK 1023u
+#define ROLLING_STATS_WINDOW 16384ull
 #define PACK(x, y) ((uint64_t)(x) | ((uint64_t)(y) << COORD_BITS))
 #define SHAPE(x0, y0, x1, y1, x2, y2, x3, y3) \
     (PACK(x0, y0) | (PACK(x1, y1) << 10) | (PACK(x2, y2) << 20) | (PACK(x3, y3) << 30))
@@ -26,6 +27,9 @@ static uint32_t* frameCounter = nullptr;
 static uint32_t* episodeLength = nullptr;
 static uint32_t* episodeRows = nullptr;
 static unsigned long long* statsCounters = nullptr;
+static uint32_t* rollingEpisodeLengths = nullptr;
+static uint32_t* rollingEpisodeRows = nullptr;
+static unsigned long long* rollingStatsCounters = nullptr;
 static uint64_t envsCount = 0;
 static int runtimeEnvsPerThread = 1;
 static int runtimeDropSpeed = 1;
@@ -85,6 +89,9 @@ void start(int64_t envs,
         cudaFree(episodeLength);
         cudaFree(episodeRows);
         cudaFree(statsCounters);
+        cudaFree(rollingEpisodeLengths);
+        cudaFree(rollingEpisodeRows);
+        cudaFree(rollingStatsCounters);
     }
 
     envsCount = (uint64_t)envs;
@@ -97,6 +104,9 @@ void start(int64_t envs,
     cudaMalloc(&episodeLength, sizeof(uint32_t) * envsCount);
     cudaMalloc(&episodeRows, sizeof(uint32_t) * envsCount);
     cudaMalloc(&statsCounters, sizeof(unsigned long long) * 3);
+    cudaMalloc(&rollingEpisodeLengths, sizeof(uint32_t) * ROLLING_STATS_WINDOW);
+    cudaMalloc(&rollingEpisodeRows, sizeof(uint32_t) * ROLLING_STATS_WINDOW);
+    cudaMalloc(&rollingStatsCounters, sizeof(unsigned long long) * 3);
 
     uint64_t blockTypeData[7] = {
         SHAPE(1, 0, 1, 1, 1, 2, 1, 3),
@@ -132,6 +142,9 @@ void start(int64_t envs,
     cudaMemset(episodeLength, 0, sizeof(uint32_t) * envsCount);
     cudaMemset(episodeRows, 0, sizeof(uint32_t) * envsCount);
     cudaMemset(statsCounters, 0, sizeof(unsigned long long) * 3);
+    cudaMemset(rollingEpisodeLengths, 0, sizeof(uint32_t) * ROLLING_STATS_WINDOW);
+    cudaMemset(rollingEpisodeRows, 0, sizeof(uint32_t) * ROLLING_STATS_WINDOW);
+    cudaMemset(rollingStatsCounters, 0, sizeof(unsigned long long) * 3);
 
     const int blockSize = 256;
     int gridSize = (int)((envsCount + blockSize - 1) / blockSize);
@@ -357,6 +370,9 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
                            uint32_t* __restrict__ episodeLengths,
                            uint32_t* __restrict__ episodeRowCounts,
                            unsigned long long* __restrict__ counters,
+                           uint32_t* __restrict__ rollingLengths,
+                           uint32_t* __restrict__ rollingRows,
+                           unsigned long long* __restrict__ rollingCounters,
                            float* __restrict__ observations,
                            float* __restrict__ rewards,
                            bool* __restrict__ done)
@@ -407,6 +423,20 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
             atomicAdd(counters + 0, 1ull);
             atomicAdd(counters + 1, (unsigned long long)currentEpisodeLength);
             atomicAdd(counters + 2, (unsigned long long)currentEpisodeRows);
+
+            unsigned long long rollingIndex = atomicAdd(rollingCounters + 0, 1ull);
+            unsigned long long rollingSlot = rollingIndex % ROLLING_STATS_WINDOW;
+            uint32_t oldLength = rollingLengths[rollingSlot];
+            uint32_t oldRows = rollingRows[rollingSlot];
+            rollingLengths[rollingSlot] = currentEpisodeLength;
+            rollingRows[rollingSlot] = currentEpisodeRows;
+            atomicAdd(rollingCounters + 1, (unsigned long long)currentEpisodeLength);
+            atomicAdd(rollingCounters + 2, (unsigned long long)currentEpisodeRows);
+            if (rollingIndex >= ROLLING_STATS_WINDOW) {
+                atomicAdd(rollingCounters + 1, 0ull - (unsigned long long)oldLength);
+                atomicAdd(rollingCounters + 2, 0ull - (unsigned long long)oldRows);
+            }
+
             currentEpisodeLength = 0u;
             currentEpisodeRows = 0u;
         } else {
@@ -434,16 +464,17 @@ __global__ void stepKernel(const uint32_t* __restrict__ actions,
     }
 }
 
-__global__ void statsKernel(const unsigned long long* __restrict__ counters, float* __restrict__ out)
+__global__ void statsKernel(const unsigned long long* __restrict__ rollingCounters, float* __restrict__ out)
 {
-    unsigned long long episodes = counters[0];
+    unsigned long long episodes = rollingCounters[0];
     if (episodes == 0ull) {
         out[0] = 0.0f;
         out[1] = 0.0f;
         return;
     }
-    out[0] = (float)((double)counters[1] / (double)episodes);
-    out[1] = (float)((double)counters[2] / (double)episodes);
+    unsigned long long divisor = episodes < ROLLING_STATS_WINDOW ? episodes : ROLLING_STATS_WINDOW;
+    out[0] = (float)((double)rollingCounters[1] / (double)divisor);
+    out[1] = (float)((double)rollingCounters[2] / (double)divisor);
 }
 
 torch::Tensor step(torch::Tensor actions, torch::Tensor observations, torch::Tensor rewards, torch::Tensor done, bool imageObservation)
@@ -469,10 +500,13 @@ torch::Tensor step(torch::Tensor actions, torch::Tensor observations, torch::Ten
                                         episodeLength,
                                         episodeRows,
                                         statsCounters,
+                                        rollingEpisodeLengths,
+                                        rollingEpisodeRows,
+                                        rollingStatsCounters,
                                         observationData,
                                         rewardData,
                                         doneData);
-    statsKernel<<<1, 1>>>(statsCounters, statsData);
+    statsKernel<<<1, 1>>>(rollingStatsCounters, statsData);
     return stats;
 }
 
